@@ -62,6 +62,38 @@ namespace ARNavigation.Tests
         }
 
         [Test]
+        public void SnapDistanceRejectsOffCorridorPositions()
+        {
+            MethodInfo method = ControllerType.GetMethod("IsSnapDistanceValid");
+            Assert.That(method.Invoke(null, new object[] { Vector3.zero, new Vector3(0.4f, 0, 0), 0.65f }), Is.True);
+            Assert.That(method.Invoke(null, new object[] { Vector3.zero, new Vector3(0.8f, 0, 0), 0.65f }), Is.False);
+        }
+
+        [Test]
+        public void EveryRoomPairHasACompleteCorridorContainedRoute()
+        {
+            var setup = EditorSceneManager.GetSceneManagerSetup();
+            try
+            {
+                EditorSceneManager.OpenScene("Assets/Scenes/SampleScene.unity", OpenSceneMode.Single);
+                Transform rooms = GameObject.Find("[Destinations]").transform;
+                foreach (string fromName in (string[])ControllerType.GetField("SelectableRoomOrder").GetValue(null))
+                foreach (string toName in (string[])ControllerType.GetField("SelectableRoomOrder").GetValue(null))
+                {
+                    if (fromName == toName) continue;
+                    Assert.That(NavMesh.SamplePosition(rooms.Find(fromName).position, out var from, 0.75f, NavMesh.AllAreas), Is.True, fromName);
+                    Assert.That(NavMesh.SamplePosition(rooms.Find(toName).position, out var to, 0.75f, NavMesh.AllAreas), Is.True, toName);
+                    var path = new NavMeshPath();
+                    Assert.That(NavMesh.CalculatePath(from.position, to.position, NavMesh.AllAreas, path), Is.True, fromName + " -> " + toName);
+                    Assert.That(path.status, Is.EqualTo(NavMeshPathStatus.PathComplete), fromName + " -> " + toName);
+                    Assert.That((bool)ControllerType.GetMethod("AreSegmentsWalkable", BindingFlags.Static | BindingFlags.NonPublic)
+                        .Invoke(null, new object[] { path.corners }), Is.True, fromName + " -> " + toName);
+                }
+            }
+            finally { RestoreScenes(setup); }
+        }
+
+        [Test]
         public void SceneHasSerializedNavigationAndARRootReferences()
         {
             var setup = EditorSceneManager.GetSceneManagerSetup();

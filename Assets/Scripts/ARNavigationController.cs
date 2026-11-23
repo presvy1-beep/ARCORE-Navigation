@@ -37,6 +37,9 @@ public class ARNavigationController : MonoBehaviour
     [Min(0f)] public float lineElevation = 0.055f;
     [Min(0.2f)] public float arrowSpacing = 0.95f;
     [Min(0.2f)] public float rerouteDistance = 0.75f;
+    [Min(0.1f)] public float maxStartSnapDistance = 0.65f;
+    [Min(0.1f)] public float maxDestinationSnapDistance = 0.75f;
+    public bool diagnostics;
 
     private readonly List<Transform> roomNodes = new List<Transform>();
     private readonly List<Vector3> meshVertices = new List<Vector3>(640);
@@ -59,6 +62,8 @@ public class ARNavigationController : MonoBehaviour
     private string statusMessage = "Initializing AR…";
     private string guidanceMessage = "Choose your current location to begin.";
     private string lastTrackingMessage;
+    private bool routePaused;
+    private Vector3 lastRouteStart;
 
     public int RoomCount => roomNodes.Count;
     public string GetRoomName(int index) => index >= 0 && index < roomNodes.Count ? roomNodes[index].name : string.Empty;
@@ -69,6 +74,7 @@ public class ARNavigationController : MonoBehaviour
     public float RemainingDistance => remainingDistance;
     public bool IsNavigating => isNavigating;
     public bool IsCalibrated => isCalibrated;
+    public bool RoutePaused => routePaused;
     public bool HasStart => currentStartRoom != null;
     public bool HasDestination => currentTargetRoom != null;
     public bool TrackingReady => ARSession.state == ARSessionState.SessionTracking;
@@ -119,6 +125,7 @@ public class ARNavigationController : MonoBehaviour
         if (!isNavigating) return;
         if (!TrackingReady)
         {
+            if (!routePaused) { ClearRoute(); routePaused = true; }
             string tracking = TrackingMessage;
             if (lastTrackingMessage != tracking)
             {
@@ -128,6 +135,7 @@ public class ARNavigationController : MonoBehaviour
             return;
         }
         lastTrackingMessage = null;
+        if (routePaused) { routePaused = false; refreshTimer = pathUpdateInterval; }
         refreshTimer += Time.unscaledDeltaTime;
         if (refreshTimer >= Mathf.Max(0.15f, pathUpdateInterval))
         {
@@ -365,8 +373,17 @@ public class ARNavigationController : MonoBehaviour
         if (arCamera == null || currentTargetRoom == null) return;
         Vector3 cameraFloor = arCamera.transform.position - Vector3.up * cameraHeightAboveFloor;
         Vector3 targetPosition = currentTargetRoom.position;
+        if (!TrySnap(cameraFloor, maxStartSnapDistance, out NavMeshHit startHit))
+        {
+            ClearRoute(); routePaused = true;
+            SetStatus("Position is outside the mapped corridor.", "Return to the corridor or recalibrate at your selected start.");
+            LogDiagnostics(cameraFloor, Vector3.zero, float.PositiveInfinity, "start snap failed", false);
+            return;
+        }
+        routePaused = false;
         bool closeEnough = IsWithinArrivalThreshold(cameraFloor, targetPosition, arrivalThreshold) &&
-                           NavMesh.SamplePosition(cameraFloor, out _, 1.8f, NavMesh.AllAreas);
+                           TrySnap(targetPosition, maxDestinationSnapDistance, out NavMeshHit arrivalHit) &&
+                           !NavMesh.Raycast(startHit.position, arrivalHit.position, out _, NavMesh.AllAreas);
         if (closeEnough)
         {
             arrivalDwellTimer += Mathf.Max(0f, Time.unscaledDeltaTime);
@@ -380,11 +397,16 @@ public class ARNavigationController : MonoBehaviour
         }
         else arrivalDwellTimer = 0f;
 
-        if (!NavMesh.SamplePosition(cameraFloor, out NavMeshHit startHit, 3f, NavMesh.AllAreas) ||
-            !NavMesh.SamplePosition(targetPosition, out NavMeshHit endHit, 2f, NavMesh.AllAreas))
+        if (!TrySnap(targetPosition, maxDestinationSnapDistance, out NavMeshHit endHit))
         {
             ClearRoute();
             SetStatus($"No walkable floor found near {currentTargetRoom.name}.", "Recalibrate at your selected start location.");
+            return;
+        }
+        if (lastRouteCorners.Count >= 2 && Vector3.Distance(startHit.position, lastRouteStart) < rerouteDistance)
+        {
+            SetStatus($"Routing to {currentTargetRoom.name}.", GetTurnInstruction(lastRouteCorners, currentTargetRoom.name));
+            LogDiagnostics(cameraFloor, startHit.position, Vector3.Distance(cameraFloor, startHit.position), "stable route", false);
             return;
         }
         if (!NavMesh.CalculatePath(startHit.position, endHit.position, NavMesh.AllAreas, navMeshPath) ||
@@ -396,16 +418,52 @@ public class ARNavigationController : MonoBehaviour
         }
 
         Vector3[] corners = navMeshPath.corners;
+        if (!AreSegmentsWalkable(corners))
+        {
+            ClearRoute();
+            SetStatus("Route leaves the walkable corridor.", "Recalibrate at your selected start location.");
+            return;
+        }
         remainingDistance = CalculatePathDistance(corners);
-        bool routeChanged = HasRouteChanged(corners, rerouteDistance);
+        bool routeChanged = lastRouteCorners.Count == 0 ||
+                            Vector3.Distance(startHit.position, lastRouteStart) >= rerouteDistance;
+        if (routeChanged && lastRouteCorners.Count > 0 && !HasRouteChanged(corners, rerouteDistance)) routeChanged = false;
         if (routeChanged)
         {
+            lastRouteStart = startHit.position;
             lastRouteCorners.Clear();
             lastRouteCorners.AddRange(corners);
             RenderRoute(corners);
         }
         guidanceMessage = GetTurnInstruction(corners, currentTargetRoom.name);
         SetStatus($"Routing to {currentTargetRoom.name}.", guidanceMessage);
+        LogDiagnostics(cameraFloor, startHit.position, Vector3.Distance(cameraFloor, startHit.position), navMeshPath.status.ToString(), routeChanged);
+    }
+
+    public static bool IsSnapDistanceValid(Vector3 requested, Vector3 snapped, float maximum)
+        => maximum > 0f && Vector3.Distance(requested, snapped) <= maximum;
+
+    private static bool TrySnap(Vector3 requested, float maximum, out NavMeshHit hit)
+        => NavMesh.SamplePosition(requested, out hit, maximum, NavMesh.AllAreas) &&
+           IsSnapDistanceValid(requested, hit.position, maximum);
+
+    private static bool AreSegmentsWalkable(IReadOnlyList<Vector3> corners)
+    {
+        for (int i = 1; i < corners.Count; i++)
+        {
+            Vector3 a = corners[i - 1], b = corners[i];
+            if (NavMesh.Raycast(a, b, out _, NavMesh.AllAreas)) return false;
+            int samples = Mathf.CeilToInt(Vector3.Distance(a, b) / 0.25f);
+            for (int j = 1; j < samples; j++)
+                if (!TrySnap(Vector3.Lerp(a, b, (float)j / samples), 0.12f, out _)) return false;
+        }
+        return true;
+    }
+
+    private void LogDiagnostics(Vector3 floor, Vector3 snapped, float snapDistance, string pathStatus, bool rerouted)
+    {
+        if (!diagnostics) return;
+        Debug.Log($"AR navigation: camera={arCamera.transform.position} floor={floor} snap={snapped} distance={snapDistance:0.00} calibrated={isCalibrated} path={pathStatus} corners=[{string.Join(", ", lastRouteCorners)}] rerouted={rerouted} paused={routePaused}", this);
     }
 
     private bool HasRouteChanged(IReadOnlyList<Vector3> corners, float movementThreshold)
@@ -456,7 +514,10 @@ public class ARNavigationController : MonoBehaviour
                 float t = Mathf.Clamp01((cursor - segmentStart) / segmentLength);
                 Vector3 center = Vector3.Lerp(corners[segment - 1], corners[segment], t);
                 Vector3 forward = Vector3.ProjectOnPlane(corners[segment] - corners[segment - 1], Vector3.up).normalized;
-                if (forward.sqrMagnitude > 0.001f) AddArrowPolygon(center + Vector3.up * (lineElevation + 0.002f), forward);
+                if (forward.sqrMagnitude > 0.001f &&
+                    cursor - segmentStart >= 0.34f && segmentStart + segmentLength - cursor >= 0.34f &&
+                    ArrowFootprintWalkable(center, forward))
+                    AddArrowPolygon(center + Vector3.up * (lineElevation + 0.002f), forward);
             }
             cursor += Mathf.Max(0.45f, arrowSpacing);
         }
@@ -468,6 +529,17 @@ public class ARNavigationController : MonoBehaviour
             arrowMesh.RecalculateNormals();
             arrowMesh.RecalculateBounds();
         }
+    }
+
+    private static bool ArrowFootprintWalkable(Vector3 center, Vector3 forward)
+    {
+        Vector3 right = Vector3.Cross(Vector3.up, forward).normalized;
+        Vector3[] points = { center + forward * 0.34f, center - forward * 0.34f + right * 0.075f,
+            center - forward * 0.34f - right * 0.075f, center + forward * 0.08f + right * 0.20f,
+            center + forward * 0.08f - right * 0.20f };
+        foreach (Vector3 point in points)
+            if (!TrySnap(point, 0.06f, out _) || NavMesh.Raycast(center, point, out _, NavMesh.AllAreas)) return false;
+        return true;
     }
 
     private void AddArrowPolygon(Vector3 center, Vector3 forward)
@@ -503,6 +575,7 @@ public class ARNavigationController : MonoBehaviour
     {
         remainingDistance = 0f;
         lastRouteCorners.Clear();
+        lastRouteStart = Vector3.zero;
         if (lineRenderer != null) { lineRenderer.positionCount = 0; lineRenderer.enabled = false; }
         if (arrowMesh != null) arrowMesh.Clear();
         if (arrowObject != null) arrowObject.SetActive(false);
