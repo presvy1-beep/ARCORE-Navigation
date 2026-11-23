@@ -405,7 +405,8 @@ public class ARNavigationController : MonoBehaviour
         }
         if (lastRouteCorners.Count >= 2 && Vector3.Distance(startHit.position, lastRouteStart) < rerouteDistance)
         {
-            SetStatus($"Routing to {currentTargetRoom.name}.", GetTurnInstruction(lastRouteCorners, currentTargetRoom.name));
+            UpdateDisplayedProgress(startHit.position);
+            SetStatus($"Routing to {currentTargetRoom.name}.", guidanceMessage);
             LogDiagnostics(cameraFloor, startHit.position, Vector3.Distance(cameraFloor, startHit.position), "stable route", false);
             return;
         }
@@ -418,26 +419,21 @@ public class ARNavigationController : MonoBehaviour
         }
 
         Vector3[] corners = navMeshPath.corners;
-        if (!AreSegmentsWalkable(corners))
+        if (!AreSegmentsWalkable(corners, out string routeFailure))
         {
             ClearRoute();
+            if (diagnostics) Debug.LogWarning($"Rejected route to {currentTargetRoom.name}: {routeFailure}; corners=[{string.Join(", ", corners)}]", this);
             SetStatus("Route leaves the walkable corridor.", "Recalibrate at your selected start location.");
             return;
         }
         remainingDistance = CalculatePathDistance(corners);
-        bool routeChanged = lastRouteCorners.Count == 0 ||
-                            Vector3.Distance(startHit.position, lastRouteStart) >= rerouteDistance;
-        if (routeChanged && lastRouteCorners.Count > 0 && !HasRouteChanged(corners, rerouteDistance)) routeChanged = false;
-        if (routeChanged)
-        {
-            lastRouteStart = startHit.position;
-            lastRouteCorners.Clear();
-            lastRouteCorners.AddRange(corners);
-            RenderRoute(corners);
-        }
-        guidanceMessage = GetTurnInstruction(corners, currentTargetRoom.name);
+        lastRouteStart = startHit.position;
+        lastRouteCorners.Clear();
+        lastRouteCorners.AddRange(corners);
+        RenderRoute(corners);
+        UpdateDisplayedProgress(startHit.position);
         SetStatus($"Routing to {currentTargetRoom.name}.", guidanceMessage);
-        LogDiagnostics(cameraFloor, startHit.position, Vector3.Distance(cameraFloor, startHit.position), navMeshPath.status.ToString(), routeChanged);
+        LogDiagnostics(cameraFloor, startHit.position, Vector3.Distance(cameraFloor, startHit.position), navMeshPath.status.ToString(), true);
     }
 
     public static bool IsSnapDistanceValid(Vector3 requested, Vector3 snapped, float maximum)
@@ -447,34 +443,64 @@ public class ARNavigationController : MonoBehaviour
         => NavMesh.SamplePosition(requested, out hit, maximum, NavMesh.AllAreas) &&
            IsSnapDistanceValid(requested, hit.position, maximum);
 
-    private static bool AreSegmentsWalkable(IReadOnlyList<Vector3> corners)
+    private static bool AreSegmentsWalkable(IReadOnlyList<Vector3> corners) => AreSegmentsWalkable(corners, out _);
+
+    public static bool AreSegmentsWalkable(IReadOnlyList<Vector3> corners, out string failure)
     {
+        failure = string.Empty;
         for (int i = 1; i < corners.Count; i++)
         {
             Vector3 a = corners[i - 1], b = corners[i];
-            if (NavMesh.Raycast(a, b, out _, NavMesh.AllAreas)) return false;
+            Vector3 direction = (b - a).normalized;
+            float inset = Mathf.Min(0.03f, Vector3.Distance(a, b) * 0.1f);
+            if (NavMesh.Raycast(a + direction * inset, b - direction * inset, out NavMeshHit obstruction, NavMesh.AllAreas))
+            {
+                bool edgeFound = NavMesh.FindClosestEdge(obstruction.position, out NavMeshHit edge, NavMesh.AllAreas);
+                failure = $"segment {i - 1} {a} -> {b}: NavMesh.Raycast hit {obstruction.position}, distance {obstruction.distance:0.000}, height delta {obstruction.position.y - a.y:0.000}, nearby edge {(edgeFound ? edge.position.ToString() : "none")}, edge distance {(edgeFound ? edge.distance : float.NaN):0.000}";
+                return false;
+            }
             int samples = Mathf.CeilToInt(Vector3.Distance(a, b) / 0.25f);
             for (int j = 1; j < samples; j++)
-                if (!TrySnap(Vector3.Lerp(a, b, (float)j / samples), 0.12f, out _)) return false;
+            {
+                Vector3 point = Vector3.Lerp(a, b, (float)j / samples);
+                if (TrySnap(point, 0.12f, out _)) continue;
+                bool found = NavMesh.SamplePosition(point, out NavMeshHit nearest, 2f, NavMesh.AllAreas);
+                NavMeshHit edge = default;
+                bool edgeFound = found && NavMesh.FindClosestEdge(nearest.position, out edge, NavMesh.AllAreas);
+                failure = $"segment {i - 1} {a} -> {b}: sample {j}/{samples} at {point}; nearest={(found ? nearest.position.ToString() : "none")}; distance={(found ? Vector3.Distance(point, nearest.position) : float.PositiveInfinity):0.000}; height delta={(found ? point.y - nearest.position.y : float.NaN):0.000}; edge={(edgeFound ? edge.position.ToString() : "none")}; edge distance={(edgeFound ? edge.distance : float.NaN):0.000}";
+                return false;
+            }
         }
         return true;
+    }
+
+    private void UpdateDisplayedProgress(Vector3 user)
+    {
+        if (lastRouteCorners.Count < 2) return;
+        float best = float.PositiveInfinity;
+        int bestSegment = 1;
+        Vector3 projected = lastRouteCorners[0];
+        for (int i = 1; i < lastRouteCorners.Count; i++)
+        {
+            Vector3 a = lastRouteCorners[i - 1], b = lastRouteCorners[i];
+            float t = Mathf.Clamp01(Vector3.Dot(user - a, b - a) / Mathf.Max((b - a).sqrMagnitude, 0.0001f));
+            Vector3 candidate = Vector3.Lerp(a, b, t);
+            float distance = (user - candidate).sqrMagnitude;
+            if (distance >= best) continue;
+            best = distance;
+            bestSegment = i;
+            projected = candidate;
+        }
+        var remaining = new List<Vector3> { projected };
+        for (int i = bestSegment; i < lastRouteCorners.Count; i++) remaining.Add(lastRouteCorners[i]);
+        remainingDistance = CalculatePathDistance(remaining);
+        guidanceMessage = GetTurnInstruction(remaining, currentTargetRoom.name);
     }
 
     private void LogDiagnostics(Vector3 floor, Vector3 snapped, float snapDistance, string pathStatus, bool rerouted)
     {
         if (!diagnostics) return;
         Debug.Log($"AR navigation: camera={arCamera.transform.position} floor={floor} snap={snapped} distance={snapDistance:0.00} calibrated={isCalibrated} path={pathStatus} corners=[{string.Join(", ", lastRouteCorners)}] rerouted={rerouted} paused={routePaused}", this);
-    }
-
-    private bool HasRouteChanged(IReadOnlyList<Vector3> corners, float movementThreshold)
-    {
-        if (lastRouteCorners.Count != corners.Count) return true;
-        if (lastRouteCorners.Count == 0) return true;
-        float thresholdSquared = movementThreshold * movementThreshold;
-        if ((lastRouteCorners[0] - corners[0]).sqrMagnitude >= thresholdSquared) return true;
-        for (int i = 1; i < corners.Count; i++)
-            if ((lastRouteCorners[i] - corners[i]).sqrMagnitude >= 0.16f) return true;
-        return false;
     }
 
     private void RenderRoute(IReadOnlyList<Vector3> corners)
@@ -534,11 +560,19 @@ public class ARNavigationController : MonoBehaviour
     private static bool ArrowFootprintWalkable(Vector3 center, Vector3 forward)
     {
         Vector3 right = Vector3.Cross(Vector3.up, forward).normalized;
-        Vector3[] points = { center + forward * 0.34f, center - forward * 0.34f + right * 0.075f,
-            center - forward * 0.34f - right * 0.075f, center + forward * 0.08f + right * 0.20f,
-            center + forward * 0.08f - right * 0.20f };
-        foreach (Vector3 point in points)
+        Vector3[] polygon = { center + forward * 0.34f,
+            center + forward * 0.08f + right * 0.20f, center + forward * 0.08f + right * 0.075f,
+            center - forward * 0.34f + right * 0.075f, center - forward * 0.34f - right * 0.075f,
+            center + forward * 0.08f - right * 0.075f, center + forward * 0.08f - right * 0.20f };
+        foreach (Vector3 point in polygon)
             if (!TrySnap(point, 0.06f, out _) || NavMesh.Raycast(center, point, out _, NavMesh.AllAreas)) return false;
+        for (int i = 0; i < polygon.Length; i++)
+        {
+            Vector3 a = polygon[i], b = polygon[(i + 1) % polygon.Length];
+            int steps = Mathf.CeilToInt(Vector3.Distance(a, b) / 0.08f);
+            for (int j = 1; j < steps; j++)
+                if (!TrySnap(Vector3.Lerp(a, b, (float)j / steps), 0.06f, out _)) return false;
+        }
         return true;
     }
 
