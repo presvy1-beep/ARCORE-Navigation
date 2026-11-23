@@ -207,6 +207,12 @@ namespace ARNavigation.Tests
 
             Vector3 originalRouteStart = line.GetPosition(0);
             Vector3 walkDirection = (line.GetPosition(1) - line.GetPosition(0)).normalized;
+            cameraTransform.position = start.position + walkDirection * 0.25f +
+                                       Vector3.up * (float)ControllerType.GetField("cameraHeightAboveFloor").GetValue(controller);
+            ControllerType.GetMethod("UpdateRoute", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(controller, null);
+            Assert.That((float)ControllerType.GetProperty("RemainingDistance").GetValue(controller), Is.LessThan(distance),
+                "Remaining distance should advance without rebuilding the displayed route.");
+            Assert.That(Vector3.Distance(line.GetPosition(0), originalRouteStart), Is.LessThan(0.01f));
             cameraTransform.position = start.position + walkDirection * 0.95f +
                                        Vector3.up * (float)ControllerType.GetField("cameraHeightAboveFloor").GetValue(controller);
             ControllerType.GetMethod("UpdateRoute", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(controller, null);

@@ -62,6 +62,43 @@ namespace ARNavigation.Tests
         }
 
         [Test]
+        public void SnapDistanceRejectsOffCorridorPositions()
+        {
+            MethodInfo method = ControllerType.GetMethod("IsSnapDistanceValid");
+            Assert.That(method.Invoke(null, new object[] { Vector3.zero, new Vector3(0.4f, 0, 0), 0.65f }), Is.True);
+            Assert.That(method.Invoke(null, new object[] { Vector3.zero, new Vector3(0.8f, 0, 0), 0.65f }), Is.False);
+        }
+
+        private static IEnumerable<TestCaseData> DirectedRoomPairs()
+        {
+            string[] rooms = { "ELT 3", "ELT 4", "ELT 5", "ELT 6", "ELT 7", "ECR 17", "ECR 18" };
+            foreach (string from in rooms)
+            foreach (string to in rooms)
+                if (from != to) yield return new TestCaseData(from, to).SetName($"Route_{from}_to_{to}");
+        }
+
+        [TestCaseSource(nameof(DirectedRoomPairs))]
+        public void EveryRoomPairHasACompleteCorridorContainedRoute(string fromName, string toName)
+        {
+            var setup = EditorSceneManager.GetSceneManagerSetup();
+            try
+            {
+                EditorSceneManager.OpenScene("Assets/Scenes/SampleScene.unity", OpenSceneMode.Single);
+                Transform rooms = GameObject.Find("[Destinations]").transform;
+                    Assert.That(NavMesh.SamplePosition(rooms.Find(fromName).position, out var from, 0.75f, NavMesh.AllAreas), Is.True, fromName);
+                    Assert.That(NavMesh.SamplePosition(rooms.Find(toName).position, out var to, 0.75f, NavMesh.AllAreas), Is.True, toName);
+                    var path = new NavMeshPath();
+                    Assert.That(NavMesh.CalculatePath(from.position, to.position, NavMesh.AllAreas, path), Is.True, fromName + " -> " + toName);
+                    Assert.That(path.status, Is.EqualTo(NavMeshPathStatus.PathComplete), fromName + " -> " + toName);
+                    object[] args = { path.corners, null };
+                    bool walkable = (bool)ControllerType.GetMethod("AreSegmentsWalkable", new[] { typeof(IReadOnlyList<Vector3>), typeof(string).MakeByRefType() })
+                        .Invoke(null, args);
+                    Assert.That(walkable, Is.True, $"{fromName} -> {toName}: {args[1]}; corners=[{string.Join(", ", path.corners)}]");
+            }
+            finally { RestoreScenes(setup); }
+        }
+
+        [Test]
         public void SceneHasSerializedNavigationAndARRootReferences()
         {
             var setup = EditorSceneManager.GetSceneManagerSetup();
